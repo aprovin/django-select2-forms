@@ -1,12 +1,23 @@
+import django
 from django import forms
 from django.db import models
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models.fields import FieldDoesNotExist
 from django.forms.models import ModelChoiceIterator
-from django.utils.encoding import force_unicode
-from django.db.models.fields.related import add_lazy_relation
+from django.utils.encoding import force_text
+from django.utils.functional import Promise
+from django.utils import six
+try:
+    from django.db.models.fields.related import lazy_related_operation
+except ImportError:
+    lazy_related_operation = None
+    from django.db.models.fields.related import add_lazy_relation
+else:
+    add_lazy_relation = None
 
-from .models.descriptors import SortableReverseManyRelatedObjectsDescriptor
+from sortedm2m.fields import SortedManyToManyField
+from sortedm2m.forms import SortedMultipleChoiceField
+
 from .widgets import Select, SelectMultiple
 
 
@@ -16,10 +27,32 @@ __all__ = (
     'ForeignKey', 'ManyToManyField',)
 
 
+def compat_add_lazy_relation(cls, field, relation, operation):
+    if add_lazy_relation is not None:
+        return add_lazy_relation(cls, field, relation, operation)
+
+    # Rearrange args for new Apps.lazy_model_operation
+    def function(local, related, field):
+        return operation(field, related, local)
+
+    lazy_related_operation(function, cls, relation, field=field)
+
+
+dj19 = bool(django.VERSION >= (1, 9))
+compat_rel = lambda f: getattr(f, 'remote_field' if dj19 else 'rel')
+compat_rel_to = lambda f: getattr(compat_rel(f), 'model' if dj19 else 'to')
+
+
 class Select2FieldMixin(object):
 
     def __init__(self, *args, **kwargs):
         widget_kwargs = {}
+        # The child field class can pass widget_kwargs as a dict. We use this
+        # in MultipleChoiceField to ensure that the field's choices get passed
+        # along to the widget. This is unnecessary for model fields since the
+        # choices in that case are iterators wrapping the queryset.
+        if 'widget_kwargs' in kwargs:
+            widget_kwargs.update(kwargs.pop('widget_kwargs'))
         widget_kwarg_keys = ['overlay', 'js_options', 'sortable', 'ajax']
         for k in widget_kwarg_keys:
             if k in kwargs:
@@ -35,9 +68,23 @@ class Select2FieldMixin(object):
         else:
             kwargs['widget'] = widget
         super(Select2FieldMixin, self).__init__(*args, **kwargs)
-        # Django 1.2 backwards-compatibility
-        if not hasattr(self.widget, 'is_required'):
-            self.widget.is_required = self.required
+
+    @property
+    def choices(self):
+        """
+        When it's time to get the choices, if it was a lazy then figure it out
+        now and memoize the result.
+        """
+        if isinstance(self._choices, Promise):
+            self._choices = list(self._choices)
+        return self._choices
+
+    @choices.setter
+    def choices(self, value):
+        self._set_choices(value)
+
+    def _set_choices(self, value):
+        self._choices = value
 
 
 class ChoiceField(Select2FieldMixin, forms.ChoiceField):
@@ -48,6 +95,25 @@ class ChoiceField(Select2FieldMixin, forms.ChoiceField):
 class MultipleChoiceField(Select2FieldMixin, forms.MultipleChoiceField):
 
     widget = SelectMultiple
+
+    def __init__(self, *args, **kwargs):
+        # Explicitly pass the choices kwarg to the widget. "widget_kwargs"
+        # is not a standard Django Form Field kwarg, but we pop it off in
+        # Select2FieldMixin.__init__
+        kwargs['widget_kwargs'] = kwargs.get('widget_kwargs') or {}
+        if 'choices' in kwargs:
+            kwargs['widget_kwargs']['choices'] = kwargs['choices']
+        super(MultipleChoiceField, self).__init__(*args, **kwargs)
+
+    def has_changed(self, initial, data):
+        widget = self.widget
+        if not isinstance(widget, SelectMultiple) and hasattr(widget, 'widget'):
+            widget = widget.widget
+        if hasattr(widget, 'format_value'):
+            initial = widget.format_value(initial)
+        else:
+            initial = widget._format_value(initial)
+        return super(MultipleChoiceField, self).has_changed(initial, data)
 
 
 class Select2ModelFieldMixin(Select2FieldMixin):
@@ -86,7 +152,7 @@ class ModelChoiceField(Select2ModelFieldMixin, forms.ModelChoiceField):
         self.widget.field = self
 
 
-class ModelMultipleChoiceField(Select2ModelFieldMixin, forms.ModelMultipleChoiceField):
+class ModelMultipleChoiceField(Select2ModelFieldMixin, SortedMultipleChoiceField):
 
     widget = SelectMultiple
 
@@ -106,7 +172,7 @@ class ModelMultipleChoiceField(Select2ModelFieldMixin, forms.ModelMultipleChoice
         elif not self.required and not value:
             return []
 
-        if isinstance(value, basestring):
+        if isinstance(value, six.string_types):
             value = value.split(',')
 
         if not isinstance(value, (list, tuple)):
@@ -122,14 +188,14 @@ class ModelMultipleChoiceField(Select2ModelFieldMixin, forms.ModelMultipleChoice
         qs = self.queryset.filter(**{
             ('%s__in' % key): value,
         })
-        pks = set([force_unicode(getattr(o, key)) for o in qs])
+        pks = set([force_text(getattr(o, key)) for o in qs])
 
         # Create a dictionary for storing the original order of the items
         # passed from the form
         pk_positions = {}
 
         for i, val in enumerate(value):
-            pk = force_unicode(val)
+            pk = force_text(val)
             if pk not in pks:
                 raise ValidationError(self.error_messages['invalid_choice'] % val)
             pk_positions[pk] = i
@@ -140,17 +206,13 @@ class ModelMultipleChoiceField(Select2ModelFieldMixin, forms.ModelMultipleChoice
             # Iterate through the objects and set the sort field to its
             # position in the comma-separated request data. Then return
             # a list of objects sorted on the sort field.
-            sort_field_name = self.sort_field.name
+            sort_value_field_name = self.sort_field.name
             objs = []
             for i, obj in enumerate(qs):
-                pk = force_unicode(getattr(obj, key))
-                setattr(obj, sort_field_name, pk_positions[pk])
+                pk = force_text(getattr(obj, key))
+                setattr(obj, sort_value_field_name, pk_positions[pk])
                 objs.append(obj)
-            sorted(objs, key=lambda obj: getattr(obj, sort_field_name))
-            return objs
-
-    def prepare_value(self, value):
-        return super(ModelMultipleChoiceField, self).prepare_value(value)
+            return sorted(objs, key=lambda obj: getattr(obj, sort_value_field_name))
 
 
 class RelatedFieldMixin(object):
@@ -170,7 +232,8 @@ class RelatedFieldMixin(object):
         super(RelatedFieldMixin, self).__init__(*args, **kwargs)
 
     def _get_queryset(self, db=None):
-        return self.rel.to._default_manager.using(db).complex_filter(self.rel.limit_choices_to)
+        return compat_rel_to(self)._default_manager.using(db).complex_filter(
+            compat_rel(self).limit_choices_to)
 
     @property
     def queryset(self):
@@ -210,7 +273,7 @@ class RelatedFieldMixin(object):
                     'field_name': self.name,
                     'app_label': self.model._meta.app_label,
                     'object_name': self.model._meta.object_name})
-        if not callable(self.search_field) and not isinstance(self.search_field, basestring):
+        if not callable(self.search_field) and not isinstance(self.search_field, six.string_types):
             raise TypeError(
                 ("keyword argument 'search_field' must be either callable or "
                  "string on field '%(field_name)s' of model "
@@ -218,8 +281,12 @@ class RelatedFieldMixin(object):
                     'field_name': self.name,
                     'app_label': self.model._meta.app_label,
                     'object_name': self.model._meta.object_name})
-        if isinstance(self.search_field, basestring):
-            opts = related.parent_model._meta
+        if isinstance(self.search_field, six.string_types):
+            try:
+                opts = related.parent_model._meta
+            except AttributeError:
+                # Django 1.8
+                opts = related.model._meta
             try:
                 opts.get_field(self.search_field)
             except FieldDoesNotExist:
@@ -238,7 +305,7 @@ class ForeignKey(RelatedFieldMixin, models.ForeignKey):
 
     def formfield(self, **kwargs):
         defaults = {
-            'to_field_name': self.rel.field_name,
+            'to_field_name': compat_rel(self).field_name,
         }
         defaults.update(**kwargs)
         return super(ForeignKey, self).formfield(**defaults)
@@ -248,25 +315,26 @@ class OneToOneField(RelatedFieldMixin, models.OneToOneField):
 
     def formfield(self, **kwargs):
         defaults = {
-            'to_field_name': self.rel.field_name,
+            'to_field_name': compat_rel(self).field_name,
         }
         defaults.update(**kwargs)
         return super(OneToOneField, self).formfield(**defaults)
 
 
-class ManyToManyField(RelatedFieldMixin, models.ManyToManyField):
+class ManyToManyField(RelatedFieldMixin, SortedManyToManyField):
 
     #: Name of the field on the through table used for storing sort position
-    sort_field_name = None
+    sort_value_field_name = None
 
     #: Instance of the field on the through table used for storing sort position
     sort_field = None
 
     def __init__(self, *args, **kwargs):
-        self.sort_field_name = kwargs.pop('sort_field', self.sort_field_name)
-        help_text = kwargs.get('help_text', u'')
+        if 'sort_field' in kwargs:
+            kwargs['sort_value_field_name'] = kwargs.pop('sort_field')
+        if 'sorted' not in kwargs:
+            kwargs['sorted'] = bool(kwargs.get('sort_value_field_name'))
         super(ManyToManyField, self).__init__(*args, **kwargs)
-        self.help_text = help_text
 
     def formfield(self, **kwargs):
         defaults = {
@@ -281,29 +349,12 @@ class ManyToManyField(RelatedFieldMixin, models.ManyToManyField):
         Replace the descriptor with our custom descriptor, so that the
         position field (which is saved in the formfield clean()) gets saved
         """
-        if self.sort_field_name is not None:
-            def resolve_sort_field(field, model, cls):
-                field.sort_field = model._meta.get_field(field.sort_field_name)
-            if isinstance(self.rel.through, basestring):
-                add_lazy_relation(cls, self, self.rel.through, resolve_sort_field)
-            else:
-                resolve_sort_field(self, self.rel.through, cls)
         super(ManyToManyField, self).contribute_to_class(cls, name)
-        if self.sort_field_name is not None:
-            setattr(cls, self.name, SortableReverseManyRelatedObjectsDescriptor(self))
-
-
-try:
-    from south.modelsinspector import add_introspection_rules
-except ImportError:
-    pass
-else:
-    add_introspection_rules(rules=[
-        ((ManyToManyField,), [], {"search_field": ["search_field", {}]}),
-    ], patterns=["^select2\.fields\.ManyToManyField"])
-    add_introspection_rules(rules=[
-        ((ForeignKey,), [], {"search_field": ["search_field", {}]}),
-    ], patterns=["^select2\.fields\.ForeignKey"])
-    add_introspection_rules(rules=[
-        ((OneToOneField,), [], {"search_field": ["search_field", {}]}),
-    ], patterns=["^select2\.fields\.OneToOneField"])
+        if self.sorted:
+            def resolve_sort_field(field, model, cls):
+                model._sort_field_name = field.sort_value_field_name
+                field.sort_field = model._meta.get_field(field.sort_value_field_name)
+            if isinstance(compat_rel(self).through, six.string_types):
+                compat_add_lazy_relation(cls, self, compat_rel(self).through, resolve_sort_field)
+            else:
+                resolve_sort_field(self, compat_rel(self).through, cls)
